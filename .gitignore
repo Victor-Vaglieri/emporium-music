@@ -1,0 +1,37 @@
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local SQLite database files (if persisted locally)
+*.db
+*.sqlite
+*.sqlite3
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local planning & internal notes (do not commit)
+plano.md
+
