@@ -1,4 +1,4 @@
-# SQLite database initialization, CSV ingestion, and PDF policy extraction.
+# SQLite database initialization, CSV ingestion, query helpers, and PDF policy extraction.
 
 import csv
 import re
@@ -6,8 +6,11 @@ import sqlite3
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 from pypdf import PdfReader
 from src.config import CSV_FILES, DB_PATH, POLICIES_PDF_PATH, validate_data_files
+
+_ACTIVE_DB_CONN: sqlite3.Connection | None = None
 
 
 # Remove accents, convert to lowercase, and collapse extra spaces.
@@ -25,6 +28,22 @@ def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.create_function("NORM", 1, normalize_text)
     return conn
+
+
+# Return the shared SQLite connection (initializing tables from CSVs on first use).
+def get_db_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
+    global _ACTIVE_DB_CONN
+    if db_path != DB_PATH:
+        return init_database(db_path)
+    if _ACTIVE_DB_CONN is None:
+        _ACTIVE_DB_CONN = init_database(DB_PATH)
+    return _ACTIVE_DB_CONN
+
+
+# Set or reset the shared SQLite connection (used by automated tests).
+def set_db_connection(conn: sqlite3.Connection | None) -> None:
+    global _ACTIVE_DB_CONN
+    _ACTIVE_DB_CONN = conn
 
 
 # Create fresh tables and load all 6 CSV files into SQLite.
@@ -167,6 +186,159 @@ def _load_promotions(cursor: sqlite3.Cursor, csv_path: Path) -> None:
         ]
     cursor.executemany("INSERT INTO promotions VALUES (?, ?, ?, ?, ?)", rows)
 
+
+# Fetch all categories along with how many products belong to each category.
+def fetch_categories_with_counts(
+    conn: sqlite3.Connection | None = None,
+) -> list[dict[str, Any]]:
+    db = conn or get_db_connection()
+    rows = db.execute(
+        "SELECT c.category_id, c.name, c.description, COUNT(p.product_id) AS prod_count "
+        "FROM categories c LEFT JOIN products p ON c.category_id = p.category_id "
+        "GROUP BY c.category_id ORDER BY c.category_id ASC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# Fetch products joined with category names and batch-loaded promotions (avoids N+1 queries).
+def fetch_products_with_promotions(
+    conn: sqlite3.Connection | None = None,
+    product_id: int | None = None,
+    category_id: int | None = None,
+    category_query: str | None = None,
+    only_available: bool = False,
+) -> list[dict[str, Any]]:
+    db = conn or get_db_connection()
+    sql = (
+        "SELECT p.*, c.name AS category_name "
+        "FROM products p "
+        "JOIN categories c ON p.category_id = c.category_id "
+        "WHERE 1=1"
+    )
+    params: list[Any] = []
+
+    if product_id is not None:
+        sql += " AND p.product_id = ?"
+        params.append(int(product_id))
+
+    if category_id is not None:
+        sql += " AND p.category_id = ?"
+        params.append(int(category_id))
+
+    norm_cat = normalize_text(category_query)
+    if norm_cat:
+        sql += " AND (NORM(c.name) LIKE ? OR NORM(c.description) LIKE ?)"
+        params.extend([f"%{norm_cat}%", f"%{norm_cat}%"])
+
+    if only_available:
+        sql += " AND p.status = 'active' AND p.stock_quantity > 0"
+
+    product_rows = db.execute(sql + " ORDER BY p.price_brl ASC", params).fetchall()
+    if not product_rows:
+        return []
+
+    # Batch-load all promotions in a single query and group by product_id.
+    promo_rows = db.execute(
+        "SELECT * FROM promotions ORDER BY promotion_id DESC"
+    ).fetchall()
+
+    active_by_pid: dict[int, dict[str, Any]] = {}
+    expired_by_pid: dict[int, list[dict[str, Any]]] = {}
+
+    for pr in promo_rows:
+        promo = dict(pr)
+        pid = int(promo["product_id"])
+        if int(promo.get("is_active", 0)) == 1:
+            active_by_pid.setdefault(pid, promo)
+        else:
+            expired_by_pid.setdefault(pid, []).append(promo)
+
+    results: list[dict[str, Any]] = []
+    for row in product_rows:
+        item = dict(row)
+        pid = int(item["product_id"])
+        item["active_promotion"] = active_by_pid.get(pid)
+        item["expired_promotions"] = expired_by_pid.get(pid, [])
+        results.append(item)
+
+    return results
+
+
+# Fetch a single order by ID joined with customer verification fields and order items.
+def fetch_order_with_details(
+    order_id: int, conn: sqlite3.Connection | None = None
+) -> dict[str, Any] | None:
+    db = conn or get_db_connection()
+    row = db.execute(
+        "SELECT o.*, c.name AS customer_name, c.email AS customer_email, "
+        "c.phone AS customer_phone, c.city AS customer_city "
+        "FROM orders o "
+        "JOIN customers c ON o.customer_id = c.customer_id "
+        "WHERE o.order_id = ?",
+        (int(order_id),),
+    ).fetchone()
+
+    if row is None:
+        return None
+
+    item_rows = db.execute(
+        "SELECT oi.quantity, oi.product_id, p.name AS product_name, "
+        "p.price_brl, p.category_id, c.name AS category_name "
+        "FROM order_items oi "
+        "JOIN products p ON oi.product_id = p.product_id "
+        "JOIN categories c ON p.category_id = c.category_id "
+        "WHERE oi.order_id = ? ORDER BY oi.product_id ASC",
+        (int(order_id),),
+    ).fetchall()
+
+    order_dict = dict(row)
+    order_dict["items"] = [dict(ir) for ir in item_rows]
+    return order_dict
+
+
+# Search customer records by name, email, or phone digits to detect homonyms or shared emails.
+def find_customers_by_identifier(
+    identifier: str, conn: sqlite3.Connection | None = None
+) -> list[dict[str, Any]]:
+    db = conn or get_db_connection()
+    norm_id = normalize_text(identifier)
+    digits_id = "".join(ch for ch in (identifier or "") if ch.isdigit())
+
+    if not norm_id and not digits_id:
+        return []
+
+    rows = db.execute(
+        "SELECT c.*, COUNT(o.order_id) AS order_count "
+        "FROM customers c LEFT JOIN orders o ON c.customer_id = o.customer_id "
+        "GROUP BY c.customer_id ORDER BY c.customer_id ASC"
+    ).fetchall()
+
+    matches: list[dict[str, Any]] = []
+    name_tokens = [t for t in norm_id.split() if len(t) >= 2]
+
+    for row in rows:
+        cust = dict(row)
+        cust_name_norm = normalize_text(cust["name"])
+        cust_email_norm = normalize_text(cust["email"])
+        cust_digits = "".join(ch for ch in (cust["phone"] or "") if ch.isdigit())
+
+        if norm_id and norm_id == cust_email_norm:
+            matches.append(cust)
+            continue
+
+        if len(digits_id) >= 8 and digits_id in cust_digits:
+            matches.append(cust)
+            continue
+
+        if name_tokens and all(
+            re.search(rf"\b{re.escape(tok)}\b", cust_name_norm) for tok in name_tokens
+        ):
+            matches.append(cust)
+
+    return matches
+
+
+
 # Extract text from the store policy PDF and split it into numbered sections.
 @lru_cache(maxsize=4)
 def load_policy_sections(pdf_path: Path = POLICIES_PDF_PATH) -> dict[str, str]:
@@ -249,5 +421,4 @@ def search_policy_sections(topic: str, pdf_path: Path = POLICIES_PDF_PATH) -> st
 
     ordered_keys = sorted(set(matched_keys), key=lambda k: int(k))
     return "\n\n---\n\n".join(sections[k] for k in ordered_keys if k in sections)
-
 

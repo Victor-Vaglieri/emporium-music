@@ -763,5 +763,3 @@ def validate_product_consistency(
         "conflicts": conflicts,
         "guidance": guidance,
     }
-
-
