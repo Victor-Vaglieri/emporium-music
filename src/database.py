@@ -63,7 +63,7 @@ def normalize_text(text: str | None) -> str:
 
 # Open a SQLite connection with Row access, foreign keys enabled, and NORM() function.
 def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path))
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.create_function("NORM", 1, normalize_text)
@@ -542,6 +542,8 @@ def search_policy_sections(topic: str, pdf_path: Path = POLICIES_PDF_PATH) -> st
 
 # Engineering review notes (documented for README.md reference):
 # 1. Resolved during refactoring:
+#    - Enabled check_same_thread=False in get_connection() so LangGraph's ThreadPoolExecutor
+#      ToolNode workers can safely query the shared SQLite connection initialized in the main thread.
 #    - Separated customer lookup strategies by input type (exact email, full/local phone digits,
 #      or >= 2 whole-word name tokens) so emails with digits never match phone numbers and single
 #      first names are rejected while preserving homonym detection (Bruno/Diego).

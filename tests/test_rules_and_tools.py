@@ -1,7 +1,19 @@
 # Automated test suite for database ingestion, business rules, tools, prompts, and agent setup.
 
 import pytest
-from src.agent import build_agent, extract_message_text
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+from src.agent import (
+    DEFAULT_RECURSION_LIMIT,
+    build_agent,
+    chat_with_agent,
+    create_chat_model,
+    extract_last_ai_reply,
+    extract_message_text,
+)
 from src.config import DB_PATH, get_llm_settings
 from src.database import (
     _normalize_db_path,
@@ -27,6 +39,7 @@ from src.rules import (
     validate_product_consistency,
 )
 from src.tools import (
+    ALL_TOOLS,
     calculate_payment_options,
     check_order_status,
     search_catalog,
@@ -385,7 +398,7 @@ def test_order_privacy_protection_and_invalid_inputs():
     assert "Invalid date format" in bad_date
 
 
-# Verify that the system prompt includes reference date, all 4 tool names, conflict rules, and store contacts.
+# Verify that the system prompt includes reference date, all 4 tool names, security guardrails, and store contacts.
 def test_system_prompt_completeness():
     prompt = get_system_prompt(reference_date="2026-03-10")
     assert "2026-03-10" in prompt
@@ -396,25 +409,150 @@ def test_system_prompt_completeness():
         "check_order_status",
     ):
         assert tool_name in prompt
+    assert "SECURITY AND INSTRUCTION HIERARCHY" in prompt
     assert "[TECHNICAL_CONFLICT_WARNING]" in prompt
     assert "(67) 3341-4444" in prompt
     assert "(67) 3321-4500" in prompt
+    assert "Crafter HT-100" not in prompt
+
+    with pytest.raises(ValueError):
+        get_system_prompt(reference_date="10/03/2026")
 
 
-# Verify agent message normalization, provider settings validation, and StateGraph compilation.
+# Verify agent message normalization, last AI reply extraction, and provider settings validation.
 def test_agent_compilation_and_message_extraction(monkeypatch):
     assert extract_message_text("  Olá músico! ") == "Olá músico!"
     assert (
         extract_message_text([{"type": "text", "text": "Bloco 1"}, "Bloco 2"])
         == "Bloco 1\nBloco 2"
     )
+    assert extract_message_text({"unexpected": "object"}) == ""
+
+    # Verify extract_last_ai_reply skips trailing ToolMessages and finds the last AIMessage with text.
+    msgs = [
+        AIMessage(content="Resposta final do assistente."),
+        ToolMessage(content="tool output", tool_call_id="call-1"),
+    ]
+    assert extract_last_ai_reply(msgs) == "Resposta final do assistente."
 
     with pytest.raises(ValueError):
         get_llm_settings(provider_override="invalid_provider")
 
     monkeypatch.setenv("GEMINI_API_KEY", "dummy-test-key")
+    with pytest.raises(ValueError):
+        create_chat_model(provider="gemini", temperature=-0.5)
+
     compiled_graph = build_agent(provider="gemini", reference_date="2026-03-10")
     assert compiled_graph is not None
+    assert chat_with_agent(compiled_graph, "   ") == ""
+    with pytest.raises(ValueError):
+        chat_with_agent(compiled_graph, "Olá", thread_id="  ")
+
+
+# Deterministic fake chat model that replays a scripted sequence of AIMessages (including tool_calls).
+class _ScriptedChatModel(BaseChatModel):
+    responses: list[AIMessage]
+    step: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted-chat-model"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(
+        self, messages: list[BaseMessage], stop=None, run_manager=None, **kwargs
+    ) -> ChatResult:
+        idx = min(self.step, len(self.responses) - 1)
+        self.step += 1
+        return ChatResult(generations=[ChatGeneration(message=self.responses[idx])])
+
+
+# Verify that DEFAULT_RECURSION_LIMIT allows legitimate multi-tool chains while stopping infinite loops.
+def test_agent_recursion_limit_allows_legitimate_multi_tool_flow():
+    # Legitimate 3-tool sequential workflow: search_catalog -> calculate_payment_options -> consult_store_policies -> final reply.
+    scripted_model = _ScriptedChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_catalog",
+                        "args": {"query": "Takamine GD20"},
+                        "id": "call_1",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "calculate_payment_options",
+                        "args": {"product_query": "95"},
+                        "id": "call_2",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "consult_store_policies",
+                        "args": {"topic": "parcelamento pix"},
+                        "id": "call_3",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="O violão Takamine GD20 (ID 95) fica por R$ 2.089,05 no PIX com 5% de desconto!"
+            ),
+        ]
+    )
+    legitimate_agent = create_react_agent(
+        model=scripted_model,
+        tools=ALL_TOOLS,
+        prompt="Test prompt",
+        checkpointer=MemorySaver(),
+    )
+    reply = chat_with_agent(
+        legitimate_agent,
+        "Quero saber tudo sobre o Takamine GD20 e regras de PIX",
+        thread_id="test-multi-tool",
+        recursion_limit=DEFAULT_RECURSION_LIMIT,
+    )
+    assert "Takamine GD20" in reply
+    assert "R$ 2.089,05" in reply
+
+    # Runaway infinite tool-call loop must be stopped by recursion_limit and raise RuntimeError.
+    looping_model = _ScriptedChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "consult_store_policies",
+                        "args": {"topic": "garantia"},
+                        "id": f"loop_{i}",
+                    }
+                ],
+            )
+            for i in range(30)
+        ]
+    )
+    looping_agent = create_react_agent(
+        model=looping_model,
+        tools=ALL_TOOLS,
+        prompt="Test prompt",
+        checkpointer=MemorySaver(),
+    )
+    with pytest.raises(RuntimeError):
+        chat_with_agent(
+            looping_agent,
+            "Loop infinito",
+            thread_id="test-loop",
+            recursion_limit=DEFAULT_RECURSION_LIMIT,
+        )
 
 
 # Engineering review notes (documented for README.md reference):
