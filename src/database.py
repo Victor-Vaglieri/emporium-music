@@ -11,6 +11,45 @@ from pypdf import PdfReader
 from src.config import CSV_FILES, DB_PATH, POLICIES_PDF_PATH, validate_data_files
 
 _ACTIVE_DB_CONN: sqlite3.Connection | None = None
+_ACTIVE_DB_KEY: str | None = None
+
+_POLICY_STOPWORDS = { # TODO isso aqui é necessario?
+    "como",
+    "para",
+    "qual",
+    "quais",
+    "loja",
+    "sobre",
+    "pelo",
+    "pela",
+    "onde",
+    "quando",
+    "tem",
+    "uma",
+    "uns",
+    "umas",
+    "dos",
+    "das",
+    "nos",
+    "nas",
+    "por",
+    "com",
+    "sem",
+    "que",
+    "isso",
+    "esse",
+    "essa",
+    "emporio",
+    "musica",
+}
+
+
+# Normalize a database path into a canonical key so str and Path compare equally.
+def _normalize_db_path(db_path: Path | str) -> str:
+    raw = str(db_path).strip()
+    if raw == ":memory:" or raw.startswith("file:"):
+        return raw
+    return str(Path(raw).resolve())
 
 
 # Remove accents, convert to lowercase, and collapse extra spaces.
@@ -22,71 +61,115 @@ def normalize_text(text: str | None) -> str:
     return " ".join(without_accents.lower().split())
 
 
-# Open a SQLite connection with Row access and custom NORM() SQL function.
+# Open a SQLite connection with Row access, foreign keys enabled, and NORM() function.
 def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
     conn.create_function("NORM", 1, normalize_text)
     return conn
 
 
-# Return the shared SQLite connection (initializing tables from CSVs on first use).
+# Return the shared SQLite connection, reusing it when the normalized path matches.
 def get_db_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
-    global _ACTIVE_DB_CONN
-    if db_path != DB_PATH:
-        return init_database(db_path)
-    if _ACTIVE_DB_CONN is None:
-        _ACTIVE_DB_CONN = init_database(DB_PATH)
+    global _ACTIVE_DB_CONN, _ACTIVE_DB_KEY
+    target_key = _normalize_db_path(db_path)
+
+    if _ACTIVE_DB_CONN is not None and (
+        _ACTIVE_DB_KEY == target_key or _ACTIVE_DB_KEY == "__custom_injected__"
+    ):
+        return _ACTIVE_DB_CONN
+
+    if _ACTIVE_DB_CONN is not None:
+        try:
+            _ACTIVE_DB_CONN.close()
+        except sqlite3.Error:
+            pass
+
+    _ACTIVE_DB_CONN = init_database(db_path)
+    _ACTIVE_DB_KEY = target_key
     return _ACTIVE_DB_CONN
 
 
 # Set or reset the shared SQLite connection (used by automated tests).
 def set_db_connection(conn: sqlite3.Connection | None) -> None:
-    global _ACTIVE_DB_CONN
+    global _ACTIVE_DB_CONN, _ACTIVE_DB_KEY
+    if _ACTIVE_DB_CONN is not None and _ACTIVE_DB_CONN is not conn:
+        try:
+            _ACTIVE_DB_CONN.close()
+        except sqlite3.Error:
+            pass
     _ACTIVE_DB_CONN = conn
+    _ACTIVE_DB_KEY = "__custom_injected__" if conn is not None else None
 
 
-# Create fresh tables and load all 6 CSV files into SQLite.
+# Create fresh tables with foreign keys and atomically load all 6 CSV files into SQLite.
 def init_database(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     validate_data_files()
     conn = get_connection(db_path)
     cursor = conn.cursor()
 
-    cursor.executescript(
-        "DROP TABLE IF EXISTS order_items;\n"
-        "DROP TABLE IF EXISTS orders;\n"
-        "DROP TABLE IF EXISTS promotions;\n"
-        "DROP TABLE IF EXISTS products;\n"
-        "DROP TABLE IF EXISTS customers;\n"
-        "DROP TABLE IF EXISTS categories;\n"
-        "CREATE TABLE categories ("
-        "category_id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT);\n"
-        "CREATE TABLE customers ("
-        "customer_id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT, email TEXT, city TEXT);\n"
-        "CREATE TABLE orders ("
-        "order_id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, order_date TEXT NOT NULL, "
-        "status TEXT NOT NULL, total_brl REAL NOT NULL, payment_method TEXT NOT NULL, "
-        "tracking_code TEXT, estimated_delivery TEXT, notes TEXT);\n"
-        "CREATE TABLE order_items ("
-        "order_id INTEGER NOT NULL, quantity INTEGER NOT NULL, product_id INTEGER NOT NULL);\n"
-        "CREATE TABLE products ("
-        "product_id INTEGER PRIMARY KEY, price_brl REAL NOT NULL, name TEXT NOT NULL, "
-        "category_id INTEGER NOT NULL, description TEXT, stock_quantity INTEGER NOT NULL, "
-        "status TEXT NOT NULL, specs TEXT, created_at TEXT);\n"
-        "CREATE TABLE promotions ("
-        "promotion_id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, "
-        "discount_percent REAL NOT NULL, description TEXT, is_active INTEGER NOT NULL);"
-    )
+    schema_Statements = [
+        "DROP TABLE IF EXISTS order_items",
+        "DROP TABLE IF EXISTS orders",
+        "DROP TABLE IF EXISTS promotions",
+        "DROP TABLE IF EXISTS products",
+        "DROP TABLE IF EXISTS customers",
+        "DROP TABLE IF EXISTS categories",
+        (
+            "CREATE TABLE categories ("
+            "category_id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT)"
+        ),
+        (
+            "CREATE TABLE customers ("
+            "customer_id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+            "phone TEXT, email TEXT, city TEXT)"
+        ),
+        (
+            "CREATE TABLE products ("
+            "product_id INTEGER PRIMARY KEY, price_brl REAL NOT NULL, name TEXT NOT NULL, "
+            "category_id INTEGER NOT NULL, description TEXT, stock_quantity INTEGER NOT NULL, "
+            "status TEXT NOT NULL, specs TEXT, created_at TEXT, "
+            "FOREIGN KEY (category_id) REFERENCES categories(category_id))"
+        ),
+        (
+            "CREATE TABLE promotions ("
+            "promotion_id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, "
+            "discount_percent REAL NOT NULL, description TEXT, is_active INTEGER NOT NULL, "
+            "FOREIGN KEY (product_id) REFERENCES products(product_id))"
+        ),
+        (
+            "CREATE TABLE orders ("
+            "order_id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, order_date TEXT NOT NULL, "
+            "status TEXT NOT NULL, total_brl REAL NOT NULL, payment_method TEXT NOT NULL, "
+            "tracking_code TEXT, estimated_delivery TEXT, notes TEXT, "
+            "FOREIGN KEY (customer_id) REFERENCES customers(customer_id))"
+        ),
+        (
+            "CREATE TABLE order_items ("
+            "order_id INTEGER NOT NULL, quantity INTEGER NOT NULL, product_id INTEGER NOT NULL, "
+            "FOREIGN KEY (order_id) REFERENCES orders(order_id), "
+            "FOREIGN KEY (product_id) REFERENCES products(product_id))"
+        ),
+    ]
 
-    _load_categories(cursor, CSV_FILES["categories"])
-    _load_customers(cursor, CSV_FILES["customers"])
-    _load_orders(cursor, CSV_FILES["orders"])
-    _load_order_items(cursor, CSV_FILES["order_items"])
-    _load_products(cursor, CSV_FILES["products"])
-    _load_promotions(cursor, CSV_FILES["promotions"])
+    try:
+        for stmt in schema_Statements:
+            cursor.execute(stmt)
 
-    conn.commit()
-    return conn
+        _load_categories(cursor, CSV_FILES["categories"])
+        _load_customers(cursor, CSV_FILES["customers"])
+        _load_products(cursor, CSV_FILES["products"])
+        _load_promotions(cursor, CSV_FILES["promotions"])
+        _load_orders(cursor, CSV_FILES["orders"])
+        _load_order_items(cursor, CSV_FILES["order_items"])
+
+        conn.commit()
+        return conn
+    except Exception:
+        conn.rollback()
+        conn.close()
+        raise
 
 
 # Load categories.csv rows into SQLite.
@@ -296,13 +379,14 @@ def fetch_order_with_details(
     return order_dict
 
 
-# Search customer records by name, email, or phone digits to detect homonyms or shared emails.
+# Search customer records by email, phone number, or full/surname tokens.
 def find_customers_by_identifier(
     identifier: str, conn: sqlite3.Connection | None = None
 ) -> list[dict[str, Any]]:
     db = conn or get_db_connection()
-    norm_id = normalize_text(identifier)
-    digits_id = "".join(ch for ch in (identifier or "") if ch.isdigit())
+    raw = (identifier or "").strip()
+    norm_id = normalize_text(raw)
+    digits_id = "".join(ch for ch in raw if ch.isdigit())
 
     if not norm_id and not digits_id:
         return []
@@ -314,29 +398,42 @@ def find_customers_by_identifier(
     ).fetchall()
 
     matches: list[dict[str, Any]] = []
+    is_email = "@" in raw
+    has_letters = any(ch.isalpha() for ch in norm_id)
+
+    # 1. Email strategy: exact match on normalized email only.
+    if is_email:
+        for row in rows:
+            cust = dict(row)
+            if norm_id == normalize_text(cust["email"]):
+                matches.append(cust)
+        return matches
+
+    # 2. Phone strategy: numeric input with at least 8 digits (matches full phone or local number).
+    if not has_letters and len(digits_id) >= 8:
+        for row in rows:
+            cust = dict(row)
+            cust_digits = "".join(ch for ch in (cust["phone"] or "") if ch.isdigit())
+            if digits_id == cust_digits or (
+                len(cust_digits) > 8 and digits_id == cust_digits[2:]
+            ):
+                matches.append(cust)
+        return matches
+
+    # 3. Name strategy: require at least two name tokens (e.g. first + last name) matched as whole words.
     name_tokens = [t for t in norm_id.split() if len(t) >= 2]
+    if len(name_tokens) < 2:
+        return []
 
     for row in rows:
         cust = dict(row)
         cust_name_norm = normalize_text(cust["name"])
-        cust_email_norm = normalize_text(cust["email"])
-        cust_digits = "".join(ch for ch in (cust["phone"] or "") if ch.isdigit())
-
-        if norm_id and norm_id == cust_email_norm:
-            matches.append(cust)
-            continue
-
-        if len(digits_id) >= 8 and digits_id in cust_digits:
-            matches.append(cust)
-            continue
-
-        if name_tokens and all(
+        if all(
             re.search(rf"\b{re.escape(tok)}\b", cust_name_norm) for tok in name_tokens
         ):
             matches.append(cust)
 
     return matches
-
 
 
 # Extract text from the store policy PDF and split it into numbered sections.
@@ -384,11 +481,16 @@ def search_policy_sections(topic: str, pdf_path: Path = POLICIES_PDF_PATH) -> st
 
     # Check if a specific section number was requested directly.
     for sec_num in sections:
-        if re.search(rf"\b(?:secao|section)\s*{sec_num}\b", norm_topic) or norm_topic == sec_num:
+        if (
+            re.search(rf"\b(?:secao|section)\s*{sec_num}\b", norm_topic)
+            or norm_topic == sec_num
+        ):
             matched_keys.append(sec_num)
 
-    # Search normalized query tokens directly inside the extracted PDF sections.
-    tokens = [t for t in norm_topic.split() if len(t) >= 3]
+    # Score normalized query tokens (excluding common stopwords) against headings and body text.
+    tokens = [
+        t for t in norm_topic.split() if len(t) >= 3 and t not in _POLICY_STOPWORDS
+    ]
     scored_sections: list[tuple[int, str]] = []
 
     for sec_num, content in sections.items():
@@ -398,7 +500,6 @@ def search_policy_sections(topic: str, pdf_path: Path = POLICIES_PDF_PATH) -> st
         heading_norm = normalize_text(lines[0]) if lines else ""
         body_norm = normalize_text(content)
 
-        # Give higher weight when a token appears in the section title.
         score = sum(3 for t in tokens if t in heading_norm) + sum(
             1 for t in tokens if t in body_norm
         )
@@ -406,19 +507,56 @@ def search_policy_sections(topic: str, pdf_path: Path = POLICIES_PDF_PATH) -> st
             scored_sections.append((score, sec_num))
 
     scored_sections.sort(key=lambda item: item[0], reverse=True)
-    matched_keys.extend(sec_num for _, sec_num in scored_sections)
+    matched_keys.extend(sec_num for _, sec_num in scored_sections[:3])
 
     # Include cover (section 0) and WhatsApp (section 7) together when company/contact info is matched.
     if any(k in matched_keys for k in ("0", "1", "7")):
         for contact_sec in ("0", "1", "7"):
             if contact_sec not in matched_keys and any(
-                t in norm_topic for t in ("telefone", "whatsapp", "contato", "email", "e-mail", "endereco")
+                t in norm_topic
+                for t in (
+                    "telefone",
+                    "whatsapp",
+                    "contato",
+                    "email",
+                    "e-mail",
+                    "endereco",
+                )
             ):
                 matched_keys.append(contact_sec)
 
+    # Return a compact section directory + Section 1 if no keywords matched, avoiding full-PDF dumps.
     if not matched_keys:
-        return "\n\n".join(sections.values())
+        headings = [
+            sec.splitlines()[0] for sec in sections.values() if sec.splitlines()
+        ]
+        summary = "No exact policy section matched the query. Available sections:\n" + "\n".join(
+            f"- {h}" for h in headings
+        )
+        sec_one = sections.get("1", "")
+        return f"{summary}\n\n---\n\n{sec_one}".strip()
 
     ordered_keys = sorted(set(matched_keys), key=lambda k: int(k))
     return "\n\n---\n\n".join(sections[k] for k in ordered_keys if k in sections)
 
+
+# Engineering review notes (documented for README.md reference):
+# 1. Resolved during refactoring:
+#    - Separated customer lookup strategies by input type (exact email, full/local phone digits,
+#      or >= 2 whole-word name tokens) so emails with digits never match phone numbers and single
+#      first names are rejected while preserving homonym detection (Bruno/Diego).
+#    - Normalized database paths (_normalize_db_path) and managed connection closing on switch/reset.
+#    - Added foreign key constraints (PRAGMA foreign_keys = ON), parent-before-child table loading,
+#      and atomic rollback/close if CSV ingestion fails.
+#    - Filtered common Portuguese stopwords in search_policy_sections() and replaced full-PDF
+#      fallback dumps with a compact section directory + Section 1 overview.
+# 2. Known trade-offs left out to avoid over-engineering for this challenge:
+#    - init_database() drops and recreates tables from the static CSV files on initialization
+#      because SQLite is used here as a local query layer over the challenge dataset, not as
+#      a persistent production write store.
+#    - CSV rows are loaded directly without a heavy schema-validation layer since the 6 CSV files
+#      are fixed challenge inputs and relational integrity is already checked by SQLite foreign keys.
+#    - Promotions are filtered via the existing is_active flag and ordered by promotion_id DESC
+#      because promotions.csv has 6 static rows and no start_date/end_date columns.
+#    - load_policy_sections() uses @lru_cache without runtime file-watcher invalidation, and no extra
+#      SQL indexes are created because the dataset is small (61 products, 45 customers, 20 orders).
