@@ -3,6 +3,7 @@
 import csv
 import re
 import sqlite3
+import threading
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
@@ -12,6 +13,7 @@ from src.config import CSV_FILES, DB_PATH, POLICIES_PDF_PATH, validate_data_file
 
 _ACTIVE_DB_CONN: sqlite3.Connection | None = None
 _ACTIVE_DB_KEY: str | None = None
+_DB_LOCK = threading.RLock()
 
 _POLICY_STOPWORDS = { # TODO isso aqui é necessario?
     "como",
@@ -274,13 +276,14 @@ def _load_promotions(cursor: sqlite3.Cursor, csv_path: Path) -> None:
 def fetch_categories_with_counts(
     conn: sqlite3.Connection | None = None,
 ) -> list[dict[str, Any]]:
-    db = conn or get_db_connection()
-    rows = db.execute(
-        "SELECT c.category_id, c.name, c.description, COUNT(p.product_id) AS prod_count "
-        "FROM categories c LEFT JOIN products p ON c.category_id = p.category_id "
-        "GROUP BY c.category_id ORDER BY c.category_id ASC"
-    ).fetchall()
-    return [dict(r) for r in rows]
+    with _DB_LOCK:
+        db = conn or get_db_connection()
+        rows = db.execute(
+            "SELECT c.category_id, c.name, c.description, COUNT(p.product_id) AS prod_count "
+            "FROM categories c LEFT JOIN products p ON c.category_id = p.category_id "
+            "GROUP BY c.category_id ORDER BY c.category_id ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # Fetch products joined with category names and batch-loaded promotions (avoids N+1 queries).
@@ -291,39 +294,57 @@ def fetch_products_with_promotions(
     category_query: str | None = None,
     only_available: bool = False,
 ) -> list[dict[str, Any]]:
-    db = conn or get_db_connection()
-    sql = (
-        "SELECT p.*, c.name AS category_name "
-        "FROM products p "
-        "JOIN categories c ON p.category_id = c.category_id "
-        "WHERE 1=1"
-    )
-    params: list[Any] = []
+    with _DB_LOCK:
+        db = conn or get_db_connection()
+        sql = (
+            "SELECT p.*, c.name AS category_name "
+            "FROM products p "
+            "JOIN categories c ON p.category_id = c.category_id "
+            "WHERE 1=1"
+        )
+        params: list[Any] = []
 
-    if product_id is not None:
-        sql += " AND p.product_id = ?"
-        params.append(int(product_id))
+        if product_id is not None:
+            sql += " AND p.product_id = ?"
+            params.append(int(product_id))
 
-    if category_id is not None:
-        sql += " AND p.category_id = ?"
-        params.append(int(category_id))
+        if category_id is not None:
+            sql += " AND p.category_id = ?"
+            params.append(int(category_id))
 
-    norm_cat = normalize_text(category_query)
-    if norm_cat:
-        sql += " AND (NORM(c.name) LIKE ? OR NORM(c.description) LIKE ?)"
-        params.extend([f"%{norm_cat}%", f"%{norm_cat}%"])
+        norm_cat = normalize_text(category_query)
+        if norm_cat:
+            clean_cat = re.sub(r"[/(),-]+", " ", norm_cat)
+            cat_stop = {"instrumento", "instrumentos", "corda", "cordas", "para", "de", "da", "do", "e"}
+            raw_tokens = [t for t in clean_cat.split() if len(t) >= 3 and t not in cat_stop] or [clean_cat.strip()]
+            cat_variants: set[str] = set()
+            for tok in raw_tokens:
+                cat_variants.add(tok)
+                cat_variants.add(tok.rstrip("s"))
+                if tok.endswith("ao"):
+                    cat_variants.add(tok[:-2] + "oes")
+                elif tok.endswith("oes"):
+                    cat_variants.add(tok[:-3] + "ao")
+            valid_variants = [v for v in cat_variants if len(v) >= 2]
+            clauses = [
+                "(NORM(c.name) LIKE ? OR NORM(c.description) LIKE ?)"
+                for _ in valid_variants
+            ]
+            sql += " AND (" + " OR ".join(clauses) + ")"
+            for v in valid_variants:
+                params.extend([f"%{v}%", f"%{v}%"])
 
-    if only_available:
-        sql += " AND p.status = 'active' AND p.stock_quantity > 0"
+        if only_available:
+            sql += " AND p.status = 'active' AND p.stock_quantity > 0"
 
-    product_rows = db.execute(sql + " ORDER BY p.price_brl ASC", params).fetchall()
-    if not product_rows:
-        return []
+        product_rows = db.execute(sql + " ORDER BY p.price_brl ASC", params).fetchall()
+        if not product_rows:
+            return []
 
-    # Batch-load all promotions in a single query and group by product_id.
-    promo_rows = db.execute(
-        "SELECT * FROM promotions ORDER BY promotion_id DESC"
-    ).fetchall()
+        # Batch-load all promotions in a single query and group by product_id.
+        promo_rows = db.execute(
+            "SELECT * FROM promotions ORDER BY promotion_id DESC"
+        ).fetchall()
 
     active_by_pid: dict[int, dict[str, Any]] = {}
     expired_by_pid: dict[int, list[dict[str, Any]]] = {}
@@ -351,87 +372,94 @@ def fetch_products_with_promotions(
 def fetch_order_with_details(
     order_id: int, conn: sqlite3.Connection | None = None
 ) -> dict[str, Any] | None:
-    db = conn or get_db_connection()
-    row = db.execute(
-        "SELECT o.*, c.name AS customer_name, c.email AS customer_email, "
-        "c.phone AS customer_phone, c.city AS customer_city "
-        "FROM orders o "
-        "JOIN customers c ON o.customer_id = c.customer_id "
-        "WHERE o.order_id = ?",
-        (int(order_id),),
-    ).fetchone()
+    with _DB_LOCK:
+        db = conn or get_db_connection()
+        row = db.execute(
+            "SELECT o.*, c.name AS customer_name, c.email AS customer_email, "
+            "c.phone AS customer_phone, c.city AS customer_city "
+            "FROM orders o "
+            "JOIN customers c ON o.customer_id = c.customer_id "
+            "WHERE o.order_id = ?",
+            (int(order_id),),
+        ).fetchone()
 
-    if row is None:
-        return None
+        if row is None:
+            return None
 
-    item_rows = db.execute(
-        "SELECT oi.quantity, oi.product_id, p.name AS product_name, "
-        "p.price_brl, p.category_id, c.name AS category_name "
-        "FROM order_items oi "
-        "JOIN products p ON oi.product_id = p.product_id "
-        "JOIN categories c ON p.category_id = c.category_id "
-        "WHERE oi.order_id = ? ORDER BY oi.product_id ASC",
-        (int(order_id),),
-    ).fetchall()
+        item_rows = db.execute(
+            "SELECT oi.quantity, oi.product_id, p.name AS product_name, "
+            "p.price_brl, p.category_id, c.name AS category_name "
+            "FROM order_items oi "
+            "JOIN products p ON oi.product_id = p.product_id "
+            "JOIN categories c ON p.category_id = c.category_id "
+            "WHERE oi.order_id = ? ORDER BY oi.product_id ASC",
+            (int(order_id),),
+        ).fetchall()
 
     order_dict = dict(row)
     order_dict["items"] = [dict(ir) for ir in item_rows]
     return order_dict
 
 
-# Search customer records by email, phone number, or full/surname tokens.
+# Search customer records by email, phone number, full/surname tokens, or composite verification strings.
 def find_customers_by_identifier(
     identifier: str, conn: sqlite3.Connection | None = None
 ) -> list[dict[str, Any]]:
-    db = conn or get_db_connection()
     raw = (identifier or "").strip()
-    norm_id = normalize_text(raw)
-    digits_id = "".join(ch for ch in raw if ch.isdigit())
-
-    if not norm_id and not digits_id:
+    if not raw:
         return []
 
-    rows = db.execute(
-        "SELECT c.*, COUNT(o.order_id) AS order_count "
-        "FROM customers c LEFT JOIN orders o ON c.customer_id = o.customer_id "
-        "GROUP BY c.customer_id ORDER BY c.customer_id ASC"
-    ).fetchall()
+    # Extract email addresses first and strip them before parsing phone digits or name tokens
+    # so digits/letters inside an email never leak into phone or name matching.
+    emails = [
+        normalize_text(m) for m in re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", raw)
+    ]
+    remaining = re.sub(r"[\w.+-]+@[\w-]+\.[\w.-]+", " ", raw)
+    norm_remaining = normalize_text(remaining)
+    digits_id = "".join(ch for ch in remaining if ch.isdigit())
+    alpha_tokens = [t for t in re.findall(r"[a-z]+", norm_remaining) if len(t) >= 2]
+
+    has_email = len(emails) > 0
+    has_phone = len(digits_id) >= 8
+    has_name = len(alpha_tokens) >= 2
+
+    # Reject inputs that do not provide at least one valid factor (or provide a single name token with no email/phone).
+    if not (has_email or has_phone or has_name):
+        return []
+    if not has_email and not has_phone and len(alpha_tokens) < 2:
+        return []
+
+    with _DB_LOCK:
+        db = conn or get_db_connection()
+        rows = db.execute(
+            "SELECT c.*, COUNT(o.order_id) AS order_count "
+            "FROM customers c LEFT JOIN orders o ON c.customer_id = o.customer_id "
+            "GROUP BY c.customer_id ORDER BY c.customer_id ASC"
+        ).fetchall()
 
     matches: list[dict[str, Any]] = []
-    is_email = "@" in raw
-    has_letters = any(ch.isalpha() for ch in norm_id)
-
-    # 1. Email strategy: exact match on normalized email only.
-    if is_email:
-        for row in rows:
-            cust = dict(row)
-            if norm_id == normalize_text(cust["email"]):
-                matches.append(cust)
-        return matches
-
-    # 2. Phone strategy: numeric input with at least 8 digits (matches full phone or local number).
-    if not has_letters and len(digits_id) >= 8:
-        for row in rows:
-            cust = dict(row)
-            cust_digits = "".join(ch for ch in (cust["phone"] or "") if ch.isdigit())
-            if digits_id == cust_digits or (
-                len(cust_digits) > 8 and digits_id == cust_digits[2:]
-            ):
-                matches.append(cust)
-        return matches
-
-    # 3. Name strategy: require at least two name tokens (e.g. first + last name) matched as whole words.
-    name_tokens = [t for t in norm_id.split() if len(t) >= 2]
-    if len(name_tokens) < 2:
-        return []
-
     for row in rows:
         cust = dict(row)
-        cust_name_norm = normalize_text(cust["name"])
-        if all(
-            re.search(rf"\b{re.escape(tok)}\b", cust_name_norm) for tok in name_tokens
-        ):
-            matches.append(cust)
+        if has_email:
+            cust_email = normalize_text(cust["email"])
+            if cust_email not in emails:
+                continue
+        if has_phone:
+            cust_digits = "".join(ch for ch in (cust["phone"] or "") if ch.isdigit())
+            phone_ok = digits_id == cust_digits or (
+                len(cust_digits) > 8 and digits_id == cust_digits[2:]
+            )
+            if not phone_ok:
+                continue
+        if has_name:
+            cust_name_norm = normalize_text(cust["name"])
+            name_ok = all(
+                re.search(rf"\b{re.escape(tok)}\b", cust_name_norm)
+                for tok in alpha_tokens
+            )
+            if not name_ok:
+                continue
+        matches.append(cust)
 
     return matches
 
@@ -541,12 +569,16 @@ def search_policy_sections(topic: str, pdf_path: Path = POLICIES_PDF_PATH) -> st
 
 
 # Engineering review notes (documented for README.md reference):
-# 1. Resolved during refactoring:
-#    - Enabled check_same_thread=False in get_connection() so LangGraph's ThreadPoolExecutor
-#      ToolNode workers can safely query the shared SQLite connection initialized in the main thread.
-#    - Separated customer lookup strategies by input type (exact email, full/local phone digits,
-#      or >= 2 whole-word name tokens) so emails with digits never match phone numbers and single
-#      first names are rejected while preserving homonym detection (Bruno/Diego).
+# 1. Resolved during refactoring and live agent testing:
+#    - Enabled check_same_thread=False in get_connection() and added a reentrant lock (_DB_LOCK)
+#      around query helpers so parallel tool calls executed concurrently by LangGraph's ToolNode
+#      ThreadPoolExecutor never corrupt shared SQLite cursors.
+#    - Added singular/plural Portuguese stem matching (-ao/-oes and -s) to category_query in
+#      fetch_products_with_promotions() so LLM calls like category='violão' match 'Violões'.
+#    - Separated customer lookup strategies by input type (exact email, composite name+phone when LLM
+#      passes both together, full/local phone digits, or >= 2 whole-word alphabetic name tokens) so
+#      emails with digits never match phone numbers and single first names are rejected while
+#      preserving homonym detection (Bruno/Diego).
 #    - Normalized database paths (_normalize_db_path) and managed connection closing on switch/reset.
 #    - Added foreign key constraints (PRAGMA foreign_keys = ON), parent-before-child table loading,
 #      and atomic rollback/close if CSV ingestion fails.

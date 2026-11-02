@@ -1,5 +1,6 @@
 # LangChain tools for catalog search, payment calculation, order lookup, and store policy lookup.
 
+import re
 from typing import Any
 from langchain_core.tools import tool
 from src.database import (
@@ -73,20 +74,35 @@ def _find_dynamic_substitutes(
 def _find_matching_empty_category(
     norm_q: str, norm_cat: str, check_query_tokens: bool = True
 ) -> dict[str, Any] | None:
+    cat_stop = {"instrumento", "instrumentos", "para", "com", "de", "da", "do", "e"}
+    clean_cat = re.sub(r"[/(),-]+", " ", norm_cat or "")
+    cat_tokens = [
+        t for t in clean_cat.split() if len(t) >= 4 and t not in cat_stop
+    ]
+
     for cat_row in fetch_categories_with_counts():
         if int(cat_row["prod_count"]) > 0:
             continue
         cat_name_norm = normalize_text(cat_row["name"])
         cat_desc_norm = normalize_text(cat_row["description"])
 
-        if norm_cat and (norm_cat in cat_name_norm or norm_cat in cat_desc_norm):
+        if norm_cat and (
+            norm_cat in cat_name_norm
+            or norm_cat in cat_desc_norm
+            or (
+                cat_tokens
+                and all(
+                    tok in cat_name_norm or tok in cat_desc_norm for tok in cat_tokens
+                )
+            )
+        ):
             return cat_row
 
         if check_query_tokens and norm_q:
             if any(
                 tok in cat_name_norm or tok in cat_desc_norm
                 for tok in norm_q.split()
-                if len(tok) >= 4
+                if len(tok) >= 4 and tok not in cat_stop
             ):
                 return cat_row
     return None
@@ -215,8 +231,10 @@ def search_catalog(
                 f"items in stock."
             )
 
+    # Fetch all products in the category first so specific queries for out-of-stock/discontinued
+    # models can still report their exact status and dynamic substitutes.
     raw_products = fetch_products_with_promotions(
-        category_query=category, only_available=only_available
+        category_query=category, only_available=False
     )
 
     if norm_q:
@@ -245,13 +263,28 @@ def search_catalog(
             )
             token_matches = True
             for tok in tokens:
-                stem = tok[:-3] + "ao" if tok.endswith("oes") else tok.rstrip("s")
-                if tok not in searchable and (len(stem) < 2 or stem not in searchable):
+                candidates = {tok, tok.rstrip("s")}
+                if tok.endswith("oes"):
+                    candidates.add(tok[:-3] + "ao")
+                elif tok.endswith("ao"):
+                    candidates.add(tok[:-2] + "oes")
+                if not any(len(c) >= 2 and c in searchable for c in candidates):
                     token_matches = False
                     break
             if token_matches:
                 matched_products.append(p)
         raw_products = matched_products
+
+    if only_available and raw_products:
+        avail_only = [
+            p
+            for p in raw_products
+            if p["status"].strip().lower() == "active" and int(p["stock_quantity"]) > 0
+        ]
+        # Keep unavailable matches when a specific query matched only out-of-stock/discontinued items
+        # so the tool can report their status and suggest available substitutes.
+        if avail_only or not norm_q:
+            raw_products = avail_only
 
     # If no catalog products matched the query, check if the query refers to an empty category.
     if not raw_products and norm_q:
@@ -305,8 +338,11 @@ def calculate_payment_options(product_query: str) -> str:
     if not cleaned:
         return "Please provide a product name or product ID to calculate payment options."
 
+    id_match = re.search(r"(?:^|\b)(?:id\s*#?|#)\s*(\d+)\b", cleaned, re.IGNORECASE)
     if cleaned.isdigit():
         matches = fetch_products_with_promotions(product_id=int(cleaned))
+    elif id_match:
+        matches = fetch_products_with_promotions(product_id=int(id_match.group(1)))
     else:
         norm_q = normalize_text(cleaned)
         all_products = fetch_products_with_promotions()
@@ -610,11 +646,16 @@ ALL_TOOLS = [
 
 
 # Engineering review notes (documented for README.md reference):
-# 1. Resolved during refactoring:
+# 1. Resolved during refactoring and live agent testing:
 #    - Moved all SQL queries out of tools.py into database.py with batch promotion loading
 #       to eliminate N+1 query overhead.
 #    - Fixed empty-category false positives in search_catalog() so queries like 'contrabaixo'
 #      or 'cordas' search actual catalog products before checking 0-product categories.
+#    - Added bidirectional Portuguese '-ao'/'-oes' stemming in search_catalog() and kept matched
+#      unavailable items when only_available=True is combined with a specific model query, ensuring
+#      queries like 'Violão Giannini GF-3D' return OUT_OF_STOCK status plus dynamic substitutes.
+#    - Updated calculate_payment_options() to parse prefixed ID strings (e.g. 'ID 90' or '#90')
+#      frequently generated by LLMs during tool calls.
 #    - Handled stopword-only queries in search_catalog() so an empty token list does not dump
 #      the entire catalog.
 #    - Added validation for negative/inverted price filters (min_price / max_price), non-positive

@@ -11,6 +11,7 @@ from langgraph.prebuilt import create_react_agent
 from src.config import get_llm_settings
 from src.database import get_db_connection
 from src.prompts import get_system_prompt
+from src.rules import set_reference_date
 from src.tools import ALL_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -62,9 +63,15 @@ def extract_message_text(content: Any) -> str:
 
 # Extract the text from the last assistant (AI) message in a LangGraph message list.
 def extract_last_ai_reply(messages: list[Any]) -> str:
+    # Prefer the final AIMessage that is not an intermediate tool-calling step.
     for msg in reversed(messages or []):
         if isinstance(msg, AIMessage) or getattr(msg, "type", None) == "ai":
-            # Skip intermediate AI messages that only contain tool calls without final text.
+            if not getattr(msg, "tool_calls", None):
+                text = extract_message_text(getattr(msg, "content", None))
+                if text:
+                    return text
+    for msg in reversed(messages or []):
+        if isinstance(msg, AIMessage) or getattr(msg, "type", None) == "ai":
             text = extract_message_text(getattr(msg, "content", None))
             if text:
                 return text
@@ -78,6 +85,7 @@ def build_agent(
     checkpointer: Any | None = None,
 ) -> Any:
     get_db_connection()
+    set_reference_date(reference_date)
     llm = create_chat_model(provider=provider)
     memory = checkpointer if checkpointer is not None else MemorySaver()
     system_prompt = get_system_prompt(reference_date=reference_date)

@@ -3,12 +3,15 @@
 import json
 import logging
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
 from src.database import load_policy_sections, normalize_text
 
 logger = logging.getLogger(__name__)
+
+STORE_TIMEZONE = timezone(timedelta(hours=-4))
+_ACTIVE_REFERENCE_DATE: date | None = None
 
 # Business-rule fallback defaults used if PDF extraction fails or a section pattern changes.
 DEFAULT_PIX_DISCOUNT_RATE = 0.05
@@ -306,6 +309,12 @@ def _parse_iso_date(value: date | str | None) -> date | None:
     return date.fromisoformat(cleaned[:10])
 
 
+# Set or reset a default reference date for deterministic agent evaluations.
+def set_reference_date(value: date | str | None) -> None:
+    global _ACTIVE_REFERENCE_DATE
+    _ACTIVE_REFERENCE_DATE = _parse_iso_date(value)
+
+
 # Parse start and reference dates and return (parsed_start_date, calendar_days_elapsed).
 def _calculate_days_elapsed(
     start_date: date | str | None, reference_date: date | str | None = None
@@ -313,7 +322,11 @@ def _calculate_days_elapsed(
     start_dt = _parse_iso_date(start_date)
     if start_dt is None:
         return None, None
-    ref_dt = _parse_iso_date(reference_date) or date.today()
+    ref_dt = (
+        _parse_iso_date(reference_date)
+        or _ACTIVE_REFERENCE_DATE
+        or datetime.now(STORE_TIMEZONE).date()
+    )
     return start_dt, (ref_dt - start_dt).days
 
 

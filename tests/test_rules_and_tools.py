@@ -352,12 +352,20 @@ def test_check_order_status_lgpd_and_homonyms():
     )
     assert "VERIFICATION_AMBIGUOUS" in shared_email
 
-    # Disambiguated Bruno with phone number or full name succeeds.
+    # Disambiguated Bruno with phone number or composite full name + phone succeeds.
     bruno_ok = check_order_status.invoke(
         {"order_id": 10, "customer_verification": "(67) 98543-2109"}
     )
     assert "Order Summary — Order #10" in bruno_ok
     assert "bruno.martins@jmail.com" not in bruno_ok
+
+    bruno_composite_ok = check_order_status.invoke(
+        {
+            "order_id": 10,
+            "customer_verification": "Bruno Carvalho Martins, bruno.martins@jmail.com, (67) 98543-2109",
+        }
+    )
+    assert "Order Summary — Order #10" in bruno_composite_ok
 
     # Partial homonym 'Diego Castro' (matches ID 13 and ID 47) on Order #14.
     diego_ambig = check_order_status.invoke(
@@ -556,11 +564,13 @@ def test_agent_recursion_limit_allows_legitimate_multi_tool_flow():
 
 
 # Engineering review notes (documented for README.md reference):
-# 1. Resolved during refactoring:
-#    - Expanded unit and integration tests from 14 to 20 single-responsibility test functions covering
-#      strict customer lookup by type, order privacy under mismatch/invalid inputs, stopword-only and
-#      empty-category search edge cases, financial boundary validations, DB path normalization,
-#      system prompt completeness, and LangGraph agent compilation.
+# 1. Resolved during refactoring and live agent testing:
+#    - Expanded unit and integration tests from 14 to 23 single-responsibility test functions covering
+#      strict customer lookup by type (including composite name+phone verification), order privacy under
+#      mismatch/invalid inputs, singular/plural Portuguese stem matching, unavailable product lookup with
+#      only_available=True, ID prefix extraction in calculate_payment_options, reference_date propagation,
+#      stopword-only and empty-category search edge cases, financial boundary validations, DB path
+#      normalization, system prompt completeness, and multi-tool recursion_limit verification.
 # 2. Known trade-offs left out to avoid over-engineering for this challenge:
 #    - Live LLM API calls (Gemini/Groq) are intentionally excluded from pytest to keep the automated
 #      test suite deterministic, fast (<2s), and offline-capable; real multi-turn LLM interactions
