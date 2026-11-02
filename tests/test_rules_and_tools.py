@@ -1,9 +1,10 @@
-# Automated test suite for database ingestion, business rules, and LangChain tools.
+# Automated test suite for database ingestion, business rules, tools, prompts, and agent setup.
 
 import pytest
+from src.agent import build_agent, extract_message_text
+from src.config import DB_PATH, get_llm_settings
 from src.database import (
-    fetch_categories_with_counts,
-    fetch_order_with_details,
+    _normalize_db_path,
     fetch_products_with_promotions,
     find_customers_by_identifier,
     init_database,
@@ -12,6 +13,7 @@ from src.database import (
     search_policy_sections,
     set_db_connection,
 )
+from src.prompts import get_system_prompt
 from src.rules import (
     build_payment_summary,
     calculate_installments,
@@ -27,7 +29,6 @@ from src.rules import (
 from src.tools import (
     calculate_payment_options,
     check_order_status,
-    consult_store_policies,
     search_catalog,
 )
 
@@ -44,7 +45,10 @@ def in_memory_db():
 
 # Verify accent removal, lowercase conversion, and whitespace collapsing.
 def test_normalize_text():
-    assert normalize_text("  Violão Clássico   Empório da Música! ") == "violao classico emporio da musica!"
+    assert (
+        normalize_text("  Violão Clássico   Empório da Música! ")
+        == "violao classico emporio da musica!"
+    )
     assert normalize_text(None) == ""
 
 
@@ -61,6 +65,20 @@ def test_database_table_counts(in_memory_db):
     for table, count in expected.items():
         actual = in_memory_db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         assert actual == count
+
+
+# Verify database path normalization between str and Path values.
+def test_database_path_normalization():
+    assert _normalize_db_path(str(DB_PATH)) == _normalize_db_path(DB_PATH)
+    assert _normalize_db_path(":memory:") == ":memory:"
+
+
+# Verify compact fallback directory when a policy search query matches no sections.
+def test_policy_search_unmatched_fallback():
+    fallback = search_policy_sections("xyz_unmatched_topic_999")
+    assert "No exact policy section matched the query. Available sections:" in fallback
+    assert "1. Sobre a Empório da Música" in fallback
+    assert "10. Disposições Finais" in fallback
 
 
 # Verify that the policy PDF splits into cover (0) plus 10 numbered sections and preserves contact divergences.
@@ -121,6 +139,24 @@ def test_installment_minimum_thresholds():
     assert len(opts_1200) == 12
 
 
+# Verify financial input validation and exact installment rounding boundaries.
+def test_financial_input_validations_and_boundaries():
+    with pytest.raises(ValueError):
+        calculate_pricing(-10.0)
+    with pytest.raises(ValueError):
+        calculate_pricing(100.0, -5.0)
+    with pytest.raises(ValueError):
+        calculate_pricing(100.0, 120.0)
+    with pytest.raises(ValueError):
+        calculate_installments(-1.0)
+    with pytest.raises(ValueError):
+        check_split_payment_eligibility(-500.0)
+
+    # Boundary around R$ 50.00 minimum for 2x: R$ 99.98 -> 49.99 (1x only); R$ 100.00 -> 50.00 (up to 2x).
+    assert [o["installments"] for o in calculate_installments(99.98)] == [1]
+    assert [o["installments"] for o in calculate_installments(100.00)] == [1, 2]
+
+
 # Verify split payment threshold (> R$ 2,000.00) and Crafter HT-100 discount boundary case.
 def test_split_payment_threshold_and_boundary():
     # Exactly R$ 2,000.00 is not > 2000.00.
@@ -137,37 +173,51 @@ def test_split_payment_threshold_and_boundary():
 # Verify Section 4.1 right of withdrawal rules (online channel, actual delivery date required, 7-day boundary).
 def test_right_of_withdrawal_rules():
     # Missing actual_delivery_date must return indeterminate (never use estimated_delivery).
-    missing_dt = evaluate_right_of_withdrawal("delivered", None, "2026-03-01", "online")
+    missing_dt = evaluate_right_of_withdrawal(
+        "delivered", None, "2026-03-01", "online"
+    )
     assert missing_dt["status"] == "indeterminate_missing_delivery_date"
     assert missing_dt["eligible"] is None
 
     # In-store purchase does not qualify under Section 4.1.
-    in_store = evaluate_right_of_withdrawal("delivered", "2026-02-20", "2026-02-22", "in_store")
+    in_store = evaluate_right_of_withdrawal(
+        "delivered", "2026-02-20", "2026-02-22", "in_store"
+    )
     assert in_store["status"] == "not_eligible_in_store"
     assert in_store["eligible"] is False
 
     # Within 7 days, channel not yet confirmed -> eligible_if_online.
-    unconfirmed_channel = evaluate_right_of_withdrawal("delivered", "2026-02-20", "2026-02-27", None)
+    unconfirmed_channel = evaluate_right_of_withdrawal(
+        "delivered", "2026-02-20", "2026-02-27", None
+    )
     assert unconfirmed_channel["status"] == "eligible_if_online"
     assert unconfirmed_channel["channel_confirmation_required"] is True
 
     # Day 7 online -> eligible; Day 8 online -> expired.
-    day_7 = evaluate_right_of_withdrawal("delivered", "2026-02-20", "2026-02-27", "online")
+    day_7 = evaluate_right_of_withdrawal(
+        "delivered", "2026-02-20", "2026-02-27", "online"
+    )
     assert day_7["status"] == "eligible"
     assert day_7["eligible"] is True
 
-    day_8 = evaluate_right_of_withdrawal("delivered", "2026-02-20", "2026-02-28", "online")
+    day_8 = evaluate_right_of_withdrawal(
+        "delivered", "2026-02-20", "2026-02-28", "online"
+    )
     assert day_8["status"] == "expired"
     assert day_8["eligible"] is False
 
 
 # Verify Section 4.3 preference exchange and Section 4.4 restrictions.
 def test_preference_exchange_and_section_4_4_restrictions():
-    restricted = evaluate_preference_exchange("delivered", "2026-02-20", "2026-02-22", is_ineligible_item=True)
+    restricted = evaluate_preference_exchange(
+        "delivered", "2026-02-20", "2026-02-22", is_ineligible_item=True
+    )
     assert restricted["status"] == "not_eligible_restricted_item"
     assert restricted["eligible"] is False
 
-    valid_7d = evaluate_preference_exchange("delivered", "2026-02-20", "2026-02-27", is_ineligible_item=False)
+    valid_7d = evaluate_preference_exchange(
+        "delivered", "2026-02-20", "2026-02-27", is_ineligible_item=False
+    )
     assert valid_7d["status"] == "eligible"
     assert valid_7d["eligible"] is True
     assert "Operational assumption" in valid_7d["milestone_assumption"]
@@ -226,6 +276,24 @@ def test_search_catalog_edge_cases():
     assert "0 instruments available" in empty_cat
 
 
+# Verify stopword-only queries, invalid price ranges, and non-blocking empty categories in search_catalog.
+def test_search_catalog_refactored_edge_cases():
+    # Stopword-only query must not dump the entire catalog.
+    stopwords_only = search_catalog.invoke({"query": "de para com"})
+    assert "Please provide a more specific search term" in stopwords_only
+
+    # Searching 'contrabaixo' must return electric basses instead of being blocked by empty category 8.
+    basses = search_catalog.invoke({"query": "contrabaixo"})
+    assert "Found " in basses
+    assert "0 instruments available" not in basses
+
+    # Negative or inverted price filters must be rejected.
+    neg_price = search_catalog.invoke({"min_price": -10})
+    assert "Invalid price filter" in neg_price
+    inv_price = search_catalog.invoke({"min_price": 2000, "max_price": 500})
+    assert "Invalid price filter" in inv_price
+
+
 # Verify ambiguous product payment lookup vs exact product lookup.
 def test_calculate_payment_options_ambiguous_and_exact():
     ambiguous = calculate_payment_options.invoke({"product_query": "Yamaha"})
@@ -234,7 +302,29 @@ def test_calculate_payment_options_ambiguous_and_exact():
     exact = calculate_payment_options.invoke({"product_query": "Takamine GD20"})
     assert "Payment Breakdown for [ID 95]" in exact
     assert "PIX (Upfront with 5% discount): R$ 2089.05" in exact
-    assert "Promoção de Páscoa (12% OFF)" in exact or "Oferta Especial (12% OFF)" in exact
+    assert (
+        "Promoção de Páscoa (12% OFF)" in exact
+        or "Oferta Especial (12% OFF)" in exact
+    )
+
+
+# Verify strict customer lookup by identifier type (email with digits, partial phone, single first name).
+def test_customer_lookup_strict_matching_and_email_with_digits(in_memory_db):
+    # Email containing phone digits of customer 11 must not match phone numbers.
+    assert (
+        find_customers_by_identifier("user985432109@jmail.com", in_memory_db) == []
+    )
+    # Single first name or short partial phone must not match.
+    assert find_customers_by_identifier("Bruno", in_memory_db) == []
+    assert find_customers_by_identifier("9854", in_memory_db) == []
+
+    # Exact email, full phone, local 9-digit phone, and 2-token name work properly.
+    assert (
+        len(find_customers_by_identifier("bruno.martins@jmail.com", in_memory_db)) == 2
+    )
+    assert len(find_customers_by_identifier("(67) 98543-2109", in_memory_db)) == 1
+    assert len(find_customers_by_identifier("98543-2109", in_memory_db)) == 1
+    assert len(find_customers_by_identifier("Bruno Martins", in_memory_db)) == 2
 
 
 # Verify two-factor LGPD privacy rules, shared email (Bruno IDs 11/43), and homonym (Diego IDs 13/47) in check_order_status.
@@ -267,3 +357,73 @@ def test_check_order_status_lgpd_and_homonyms():
         {"order_id": 14, "customer_verification": "diego.castro@coldmail.com"}
     )
     assert "Order Summary — Order #14" in diego_ok
+
+
+# Verify order data protection on mismatched customer verification and validation of malformed inputs.
+def test_order_privacy_protection_and_invalid_inputs():
+    # Wrong customer verification on Order #1 must not expose tracking code or items.
+    mismatch = check_order_status.invoke(
+        {"order_id": 1, "customer_verification": "diego.castro@coldmail.com"}
+    )
+    assert "VERIFICATION_FAILED" in mismatch
+    assert "BR" not in mismatch
+    assert "Gabriela" not in mismatch
+
+    # Invalid order_id and non-ISO delivery date format must return clear validation errors.
+    bad_id = check_order_status.invoke(
+        {"order_id": 0, "customer_verification": "Gabriela Costa Ferreira"}
+    )
+    assert "Invalid Order ID" in bad_id
+
+    bad_date = check_order_status.invoke(
+        {
+            "order_id": 1,
+            "customer_verification": "Gabriela Costa Ferreira",
+            "actual_delivery_date": "15/02/2026",
+        }
+    )
+    assert "Invalid date format" in bad_date
+
+
+# Verify that the system prompt includes reference date, all 4 tool names, conflict rules, and store contacts.
+def test_system_prompt_completeness():
+    prompt = get_system_prompt(reference_date="2026-03-10")
+    assert "2026-03-10" in prompt
+    for tool_name in (
+        "search_catalog",
+        "calculate_payment_options",
+        "consult_store_policies",
+        "check_order_status",
+    ):
+        assert tool_name in prompt
+    assert "[TECHNICAL_CONFLICT_WARNING]" in prompt
+    assert "(67) 3341-4444" in prompt
+    assert "(67) 3321-4500" in prompt
+
+
+# Verify agent message normalization, provider settings validation, and StateGraph compilation.
+def test_agent_compilation_and_message_extraction(monkeypatch):
+    assert extract_message_text("  Olá músico! ") == "Olá músico!"
+    assert (
+        extract_message_text([{"type": "text", "text": "Bloco 1"}, "Bloco 2"])
+        == "Bloco 1\nBloco 2"
+    )
+
+    with pytest.raises(ValueError):
+        get_llm_settings(provider_override="invalid_provider")
+
+    monkeypatch.setenv("GEMINI_API_KEY", "dummy-test-key")
+    compiled_graph = build_agent(provider="gemini", reference_date="2026-03-10")
+    assert compiled_graph is not None
+
+
+# Engineering review notes (documented for README.md reference):
+# 1. Resolved during refactoring:
+#    - Expanded unit and integration tests from 14 to 20 single-responsibility test functions covering
+#      strict customer lookup by type, order privacy under mismatch/invalid inputs, stopword-only and
+#      empty-category search edge cases, financial boundary validations, DB path normalization,
+#      system prompt completeness, and LangGraph agent compilation.
+# 2. Known trade-offs left out to avoid over-engineering for this challenge:
+#    - Live LLM API calls (Gemini/Groq) are intentionally excluded from pytest to keep the automated
+#      test suite deterministic, fast (<2s), and offline-capable; real multi-turn LLM interactions
+#      are validated separately and recorded in examples/interacoes_exemplos.md.
