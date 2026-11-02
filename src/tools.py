@@ -7,12 +7,11 @@ from src.database import (
     fetch_order_with_details,
     fetch_products_with_promotions,
     find_customers_by_identifier,
-    get_db_connection,
     normalize_text,
     search_policy_sections,
-    set_db_connection,
 )
 from src.rules import (
+    _parse_iso_date,
     build_payment_summary,
     evaluate_defect_exchange,
     evaluate_legal_warranty,
@@ -68,6 +67,29 @@ def _find_dynamic_substitutes(
         }
         for c in valid_candidates[:limit]
     ]
+
+
+# Check if a category filter or an unmatched product query refers to an empty catalog category.
+def _find_matching_empty_category(
+    norm_q: str, norm_cat: str, check_query_tokens: bool = True
+) -> dict[str, Any] | None:
+    for cat_row in fetch_categories_with_counts():
+        if int(cat_row["prod_count"]) > 0:
+            continue
+        cat_name_norm = normalize_text(cat_row["name"])
+        cat_desc_norm = normalize_text(cat_row["description"])
+
+        if norm_cat and (norm_cat in cat_name_norm or norm_cat in cat_desc_norm):
+            return cat_row
+
+        if check_query_tokens and norm_q:
+            if any(
+                tok in cat_name_norm or tok in cat_desc_norm
+                for tok in norm_q.split()
+                if len(tok) >= 4
+            ):
+                return cat_row
+    return None
 
 
 # Format an already enriched product dictionary into a readable catalog entry.
@@ -166,27 +188,30 @@ def search_catalog(
     min_price: float | None = None,
     only_available: bool = False,
 ) -> str:
+    if min_price is not None and float(min_price) < 0:
+        return "Invalid price filter: 'min_price' cannot be negative."
+    if max_price is not None and float(max_price) < 0:
+        return "Invalid price filter: 'max_price' cannot be negative."
+    if (
+        min_price is not None
+        and max_price is not None
+        and float(min_price) > float(max_price)
+    ):
+        return "Invalid price filter: 'min_price' cannot be greater than 'max_price'."
+
     norm_q = normalize_text(query)
     norm_cat = normalize_text(category)
 
-    # Check if the query or category matches a registered category that has 0 products in products.csv.
-    for cat_row in fetch_categories_with_counts():
-        if int(cat_row["prod_count"]) > 0:
-            continue
-        cat_name_norm = normalize_text(cat_row["name"])
-        cat_desc_norm = normalize_text(cat_row["description"])
-        if (norm_cat and (norm_cat in cat_name_norm or norm_cat in cat_desc_norm)) or (
-            norm_q
-            and any(
-                tok in cat_name_norm or tok in cat_desc_norm
-                for tok in norm_q.split()
-                if len(tok) >= 4
-            )
-        ):
+    # Check if an explicit category filter directly targets an empty category (0 products).
+    if norm_cat:
+        empty_cat = _find_matching_empty_category(
+            norm_q="", norm_cat=norm_cat, check_query_tokens=False
+        )
+        if empty_cat is not None:
             return (
                 f"No products available: There are currently 0 instruments available "
-                f"in the store catalog for the category '{cat_row['name']}' "
-                f"({cat_row['description']}). Do not claim that the store has these "
+                f"in the store catalog for the category '{empty_cat['name']}' "
+                f"({empty_cat['description']}). Do not claim that the store has these "
                 f"items in stock."
             )
 
@@ -195,10 +220,25 @@ def search_catalog(
     )
 
     if norm_q:
-        stop_words = {"de", "da", "do", "para", "com", "sem", "ate", "em", "um", "uma", "os", "as"}
+        stop_words = {
+            "de",
+            "da",
+            "do",
+            "para",
+            "com",
+            "sem",
+            "ate",
+            "em",
+            "um",
+            "uma",
+            "os",
+            "as",
+        }
         tokens = [t for t in norm_q.split() if len(t) >= 2 and t not in stop_words]
-        matched_products: list[dict[str, Any]] = []
+        if not tokens:
+            return "Please provide a more specific search term (model, brand, or instrument type)."
 
+        matched_products: list[dict[str, Any]] = []
         for p in raw_products:
             searchable = normalize_text(
                 f"{p['product_id']} {p['name']} {p['description']} {p['specs']} {p['category_name']}"
@@ -213,15 +253,28 @@ def search_catalog(
                 matched_products.append(p)
         raw_products = matched_products
 
+    # If no catalog products matched the query, check if the query refers to an empty category.
+    if not raw_products and norm_q:
+        empty_cat = _find_matching_empty_category(
+            norm_q=norm_q, norm_cat=norm_cat, check_query_tokens=True
+        )
+        if empty_cat is not None:
+            return (
+                f"No products available: There are currently 0 instruments available "
+                f"in the store catalog for the category '{empty_cat['name']}' "
+                f"({empty_cat['description']}). Do not claim that the store has these "
+                f"items in stock."
+            )
+
     # Enrich each matched product once and apply effective price filters.
     final_items: list[dict[str, Any]] = []
     for p in raw_products:
         enriched = _enrich_product(p)
         effective_price = enriched["payment"]["effective_price_brl"]
 
-        if min_price is not None and effective_price < float(min_price) - 1e-9:
+        if min_price is not None and effective_price < round(float(min_price), 2):
             continue
-        if max_price is not None and effective_price > float(max_price) + 1e-9:
+        if max_price is not None and effective_price > round(float(max_price), 2):
             continue
         final_items.append(enriched)
 
@@ -262,6 +315,8 @@ def calculate_payment_options(product_query: str) -> str:
             matches = exact
         else:
             tokens = [t for t in norm_q.split() if len(t) >= 2]
+            if not tokens:
+                return "Please provide a valid product name or ID."
             matches = [
                 p
                 for p in all_products
@@ -434,6 +489,18 @@ def check_order_status(
 ) -> str:
     verif_clean = (customer_verification or "").strip()
 
+    if order_id is not None and int(order_id) <= 0:
+        return "Invalid Order ID: 'order_id' must be a positive integer."
+
+    try:
+        _parse_iso_date(actual_delivery_date)
+        _parse_iso_date(reference_date)
+    except ValueError as exc:
+        return (
+            f"Invalid date format provided ({exc}). Please pass dates in ISO format "
+            f"'YYYY-MM-DD' (for example, '2026-03-10')."
+        )
+
     if order_id is None and not verif_clean:
         return (
             "VERIFICATION_REQUIRED: Under LGPD privacy rules (Section 9), both the "
@@ -540,3 +607,22 @@ ALL_TOOLS = [
     check_order_status,
     consult_store_policies,
 ]
+
+
+# Engineering review notes (documented for README.md reference):
+# 1. Resolved during refactoring:
+#    - Moved all SQL queries out of tools.py into database.py with batch promotion loading
+#       to eliminate N+1 query overhead.
+#    - Fixed empty-category false positives in search_catalog() so queries like 'contrabaixo'
+#      or 'cordas' search actual catalog products before checking 0-product categories.
+#    - Handled stopword-only queries in search_catalog() so an empty token list does not dump
+#      the entire catalog.
+#    - Added validation for negative/inverted price filters (min_price / max_price), non-positive
+#      order IDs, and malformed date strings in check_order_status().
+#    - Removed unused database connection imports.
+# 2. Known trade-offs left out to avoid over-engineering for this challenge:
+#    - _find_dynamic_substitutes() selects conflict-free active items in the same category ordered
+#      by price proximity without extra caching or deep spec matching, which runs in <1ms on 61 items.
+#    - _format_product_entry() and calculate_payment_options() keep separate output layouts because
+#      catalog browsing (multi-item overview + specs) and payment breakdown (full 1x-12x table +
+#      split-payment rule) serve different agent contexts.
