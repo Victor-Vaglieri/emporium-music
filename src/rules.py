@@ -1,14 +1,16 @@
 # Deterministic business rules for pricing, installments, post-sale deadlines, and catalog validation.
 
 import json
+import logging
 import re
 from datetime import date
 from functools import lru_cache
 from typing import Any
 from src.database import load_policy_sections, normalize_text
 
+logger = logging.getLogger(__name__)
 
-# TODO pass all these defaults to the .env file and allow overrides via environment variables.
+# Business-rule fallback defaults used if PDF extraction fails or a section pattern changes.
 DEFAULT_PIX_DISCOUNT_RATE = 0.05
 DEFAULT_MIN_INSTALLMENT_2_TO_3X_BRL = 50.00
 DEFAULT_MIN_INSTALLMENT_4_TO_6X_BRL = 80.00
@@ -21,6 +23,10 @@ DEFAULT_DEFECT_EXCHANGE_DAYS = 30
 DEFAULT_PREFERENCE_EXCHANGE_DAYS = 7
 DEFAULT_LEGAL_WARRANTY_DAYS = 90
 
+# Accepted purchase channel aliases in English (from tool schema) and Portuguese (from customer phrasing).
+IN_STORE_CHANNELS: tuple[str, ...] = ("in_store", "presencial", "physical", "loja")
+ONLINE_CHANNELS: tuple[str, ...] = ("online", "web", "site", "whatsapp")
+
 
 # Convert a Brazilian currency number string (e.g., '2.000,00' or '50,00') to float.
 def _parse_brl_number(raw_value: str, fallback: float) -> float:
@@ -29,6 +35,20 @@ def _parse_brl_number(raw_value: str, fallback: float) -> float:
         return float(cleaned)
     except ValueError:
         return fallback
+
+
+# Validate that a monetary price is non-negative and an optional discount percentage is between 0 and 100.
+def _validate_financial_inputs(
+    amount_brl: float, discount_percent: float | None = None
+) -> None:
+    if float(amount_brl) < 0.0:
+        raise ValueError(f"Monetary amount cannot be negative: {amount_brl}")
+    if discount_percent is not None:
+        disc = float(discount_percent)
+        if disc < 0.0 or disc > 100.0:
+            raise ValueError(
+                f"Discount percentage must be between 0 and 100, got: {discount_percent}"
+            )
 
 
 # Extract commercial and post-sale rule parameters from the store policy PDF with safe fallbacks.
@@ -49,16 +69,23 @@ def get_policy_rules() -> dict[str, Any]:
 
     try:
         sections = load_policy_sections()
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Failed to load store policy PDF; falling back to default business rules: %s",
+            exc,
+        )
         return rules
 
     sec3 = normalize_text(sections.get("3", ""))
     if sec3:
         pix_match = re.search(r"pix.*?(\d+(?:[.,]\d+)?)%\s*de\s*desconto", sec3)
         if pix_match:
-            rules["pix_discount_rate"] = _parse_brl_number(
-                pix_match.group(1), DEFAULT_PIX_DISCOUNT_RATE * 100.0
-            ) / 100.0
+            rules["pix_discount_rate"] = (
+                _parse_brl_number(
+                    pix_match.group(1), DEFAULT_PIX_DISCOUNT_RATE * 100.0
+                )
+                / 100.0
+            )
 
         m_3x = re.search(r"ate\s*3x:.*?r\$\s*([\d.,]+)", sec3)
         if m_3x:
@@ -86,7 +113,9 @@ def get_policy_rules() -> dict[str, Any]:
 
     sec4 = normalize_text(sections.get("4", ""))
     if sec4:
-        m_withdraw = re.search(r"4\.1\s*direito\s*de\s*arrependimento.*?em\s*ate\s*(\d+)", sec4)
+        m_withdraw = re.search(
+            r"4\.1\s*direito\s*de\s*arrependimento.*?em\s*ate\s*(\d+)", sec4
+        )
         if m_withdraw:
             rules["withdrawal_days"] = int(m_withdraw.group(1))
 
@@ -98,13 +127,17 @@ def get_policy_rules() -> dict[str, Any]:
         if m_defect:
             rules["defect_exchange_days"] = int(m_defect.group(1))
 
-        m_pref = re.search(r"4\.3\s*trocas\s*por\s*preferencia.*?em\s*ate\s*(\d+)\s*dias", sec4)
+        m_pref = re.search(
+            r"4\.3\s*trocas\s*por\s*preferencia.*?em\s*ate\s*(\d+)\s*dias", sec4
+        )
         if m_pref:
             rules["preference_exchange_days"] = int(m_pref.group(1))
 
     sec8 = normalize_text(sections.get("8", ""))
     if sec8:
-        m_warranty = re.search(r"8\.1\s*garantia\s*legal.*?garantia\s*legal\s*de\s*(\d+)", sec8)
+        m_warranty = re.search(
+            r"8\.1\s*garantia\s*legal.*?garantia\s*legal\s*de\s*(\d+)", sec8
+        )
         if m_warranty:
             rules["legal_warranty_days"] = int(m_warranty.group(1))
 
@@ -115,6 +148,7 @@ def get_policy_rules() -> dict[str, Any]:
 def calculate_pricing(
     price_brl: float, active_discount_percent: float | None = None
 ) -> dict[str, Any]:
+    _validate_financial_inputs(price_brl, active_discount_percent)
     policy = get_policy_rules()
     pix_rate = policy["pix_discount_rate"]
 
@@ -144,6 +178,7 @@ def calculate_pricing(
 
 # Calculate valid interest-free credit card installment options from 1x to 12x (Section 3.1).
 def calculate_installments(amount_brl: float) -> list[dict[str, Any]]:
+    _validate_financial_inputs(amount_brl)
     total = round(float(amount_brl), 2)
     if total <= 0:
         return []
@@ -158,10 +193,9 @@ def calculate_installments(amount_brl: float) -> list[dict[str, Any]]:
     ]
 
     for count in range(2, 13):
-        raw_installment = total / count
-        installment_value = round(raw_installment, 2)
+        installment_value = round(total / count, 2)
 
-        if 2 <= count <= 3 and raw_installment >= min_2_3 - 1e-9:
+        if 2 <= count <= 3 and installment_value >= min_2_3:
             options.append(
                 {
                     "installments": count,
@@ -169,7 +203,7 @@ def calculate_installments(amount_brl: float) -> list[dict[str, Any]]:
                     "total_brl": total,
                 }
             )
-        elif 4 <= count <= 6 and raw_installment >= min_4_6 - 1e-9:
+        elif 4 <= count <= 6 and installment_value >= min_4_6:
             options.append(
                 {
                     "installments": count,
@@ -177,7 +211,7 @@ def calculate_installments(amount_brl: float) -> list[dict[str, Any]]:
                     "total_brl": total,
                 }
             )
-        elif 7 <= count <= 12 and raw_installment >= min_7_12 - 1e-9:
+        elif 7 <= count <= 12 and installment_value >= min_7_12:
             options.append(
                 {
                     "installments": count,
@@ -193,9 +227,17 @@ def calculate_installments(amount_brl: float) -> list[dict[str, Any]]:
 def check_split_payment_eligibility(
     effective_price_brl: float, original_price_brl: float | None = None
 ) -> dict[str, Any]:
+    _validate_financial_inputs(effective_price_brl)
+    if original_price_brl is not None:
+        _validate_financial_inputs(original_price_brl)
+
     threshold = get_policy_rules()["split_payment_threshold_brl"]
     effective = round(float(effective_price_brl), 2)
-    original = round(float(original_price_brl), 2) if original_price_brl is not None else effective
+    original = (
+        round(float(original_price_brl), 2)
+        if original_price_brl is not None
+        else effective
+    )
     eligible = effective > threshold
 
     crossed_threshold_after_discount = original > threshold >= effective
@@ -234,8 +276,14 @@ def build_payment_summary(
     pricing = calculate_pricing(price_brl, active_discount_percent)
     effective = pricing["effective_price_brl"]
     installments = calculate_installments(effective)
-    max_opt = installments[-1] if installments else {"installments": 1, "installment_brl": effective}
-    split_info = check_split_payment_eligibility(effective, pricing["original_price_brl"])
+    max_opt = (
+        installments[-1]
+        if installments
+        else {"installments": 1, "installment_brl": effective}
+    )
+    split_info = check_split_payment_eligibility(
+        effective, pricing["original_price_brl"]
+    )
 
     return {
         **pricing,
@@ -257,14 +305,19 @@ def _parse_iso_date(value: date | str | None) -> date | None:
         return None
     return date.fromisoformat(cleaned[:10])
 
-# TODO: Refactor the return and error-handling logic.
-# Each business rule condition currently requires a separate response
-# with a manually written message.
-# As new parameters and conditions are introduced, this approach may
-# lead to duplicated code and become difficult to maintain.
-# Consider separating response messages from business logic.
+
+# Parse start and reference dates and return (parsed_start_date, calendar_days_elapsed).
+def _calculate_days_elapsed(
+    start_date: date | str | None, reference_date: date | str | None = None
+) -> tuple[date | None, int | None]:
+    start_dt = _parse_iso_date(start_date)
+    if start_dt is None:
+        return None, None
+    ref_dt = _parse_iso_date(reference_date) or date.today()
+    return start_dt, (ref_dt - start_dt).days
 
 
+# Evaluate Section 4.1 right of withdrawal (7 calendar days from actual receipt, online purchases only).
 def evaluate_right_of_withdrawal(
     order_status: str,
     actual_delivery_date: date | str | None = None,
@@ -277,7 +330,7 @@ def evaluate_right_of_withdrawal(
     status_clean = (order_status or "").strip().lower()
     channel_clean = (purchase_channel or "").strip().lower() or None
 
-    if channel_clean in ("in_store", "presencial", "physical", "loja"): # TODO explain why using these keywords
+    if channel_clean in IN_STORE_CHANNELS:
         return {
             "rule": "right_of_withdrawal_section_4_1",
             "status": "not_eligible_in_store",
@@ -290,7 +343,7 @@ def evaluate_right_of_withdrawal(
             ),
         }
 
-    channel_confirmation_required = channel_clean not in ("online", "web", "whatsapp") # TODO explain why using these keywords
+    channel_confirmation_required = channel_clean not in ONLINE_CHANNELS
 
     if status_clean == "cancelled":
         return {
@@ -315,8 +368,10 @@ def evaluate_right_of_withdrawal(
             ),
         }
 
-    delivery_dt = _parse_iso_date(actual_delivery_date)
-    if delivery_dt is None:
+    delivery_dt, days_elapsed = _calculate_days_elapsed(
+        actual_delivery_date, reference_date
+    )
+    if delivery_dt is None or days_elapsed is None:
         return {
             "rule": "right_of_withdrawal_section_4_1",
             "status": "indeterminate_missing_delivery_date",
@@ -331,9 +386,6 @@ def evaluate_right_of_withdrawal(
             ),
         }
 
-    ref_dt = _parse_iso_date(reference_date) or date.today()
-    days_elapsed = (ref_dt - delivery_dt).days
-
     if days_elapsed < 0:
         return {
             "rule": "right_of_withdrawal_section_4_1",
@@ -345,8 +397,7 @@ def evaluate_right_of_withdrawal(
             "note": "Reference date is earlier than the reported delivery date.",
         }
 
-    within_window = days_elapsed <= limit_days
-    if not within_window:
+    if days_elapsed > limit_days:
         return {
             "rule": "right_of_withdrawal_section_4_1",
             "status": "expired",
@@ -444,8 +495,10 @@ def evaluate_preference_exchange(
             "note": f"Order status is '{status_clean}' and has not been delivered yet.",
         }
 
-    delivery_dt = _parse_iso_date(actual_delivery_date)
-    if delivery_dt is None:
+    delivery_dt, days_elapsed = _calculate_days_elapsed(
+        actual_delivery_date, reference_date
+    )
+    if delivery_dt is None or days_elapsed is None:
         return {
             "rule": "preference_exchange_section_4_3",
             "status": "indeterminate_missing_delivery_date",
@@ -457,9 +510,6 @@ def evaluate_preference_exchange(
                 "Ask the customer when they received the item."
             ),
         }
-
-    ref_dt = _parse_iso_date(reference_date) or date.today()
-    days_elapsed = (ref_dt - delivery_dt).days
 
     if days_elapsed < 0:
         return {
@@ -509,8 +559,8 @@ def evaluate_defect_exchange(
             "note": "This order is cancelled.",
         }
 
-    purchase_dt = _parse_iso_date(order_date)
-    if purchase_dt is None:
+    purchase_dt, days_elapsed = _calculate_days_elapsed(order_date, reference_date)
+    if purchase_dt is None or days_elapsed is None:
         return {
             "rule": "defect_exchange_section_4_2",
             "status": "indeterminate_missing_order_date",
@@ -518,9 +568,6 @@ def evaluate_defect_exchange(
             "limit_days": limit_days,
             "note": "Missing purchase date (order_date) to evaluate the 30-day store defect exchange window.",
         }
-
-    ref_dt = _parse_iso_date(reference_date) or date.today()
-    days_elapsed = (ref_dt - purchase_dt).days
 
     if days_elapsed < 0:
         return {
@@ -593,8 +640,10 @@ def evaluate_legal_warranty(
             ),
         }
 
-    delivery_dt = _parse_iso_date(actual_delivery_date)
-    if delivery_dt is None:
+    delivery_dt, days_elapsed = _calculate_days_elapsed(
+        actual_delivery_date, reference_date
+    )
+    if delivery_dt is None or days_elapsed is None:
         return {
             "rule": "legal_warranty_section_8",
             "status": "indeterminate_missing_delivery_date",
@@ -606,9 +655,6 @@ def evaluate_legal_warranty(
                 f"customer when they received the product."
             ),
         }
-
-    ref_dt = _parse_iso_date(reference_date) or date.today()
-    days_elapsed = (ref_dt - delivery_dt).days
 
     if days_elapsed < 0:
         return {
@@ -689,8 +735,12 @@ def validate_product_consistency(
             conflicts.append("Invalid JSON format in specs column.")
 
     # 1. Check brand mismatch between product name and description.
-    name_brands = [b for b in CATALOG_BRANDS if re.search(rf"\b{re.escape(b)}\b", norm_name)]
-    desc_brands = [b for b in CATALOG_BRANDS if re.search(rf"\b{re.escape(b)}\b", norm_desc)]
+    name_brands = [
+        b for b in CATALOG_BRANDS if re.search(rf"\b{re.escape(b)}\b", norm_name)
+    ]
+    desc_brands = [
+        b for b in CATALOG_BRANDS if re.search(rf"\b{re.escape(b)}\b", norm_desc)
+    ]
 
     if name_brands and desc_brands:
         if not set(name_brands).intersection(desc_brands):
@@ -763,3 +813,20 @@ def validate_product_consistency(
         "conflicts": conflicts,
         "guidance": guidance,
     }
+
+
+# Engineering review notes (documented for README.md reference):
+# 1. Resolved during refactoring:
+#    - Added warning logs in get_policy_rules() when PDF extraction falls back to defaults.
+#    - Added _validate_financial_inputs() to reject negative prices or invalid discount ranges (0-100%).
+#    - Evaluated installment minimum thresholds against the rounded 2-decimal installment amount.
+#    - Extracted _calculate_days_elapsed() to avoid repeating date parsing across post-sale evaluators.
+#    - Defined explicit IN_STORE_CHANNELS and ONLINE_CHANNELS constants for bilingual channel matching.
+# 2. Known trade-offs left out to avoid over-engineering for this challenge:
+#    - Business-rule fallback defaults stay in rules.py instead of .env because store deadlines,
+#      PIX rates, and installment thresholds are domain rules rather than environment config.
+#    - The four post-sale evaluators remain separate functions with inline result messages instead
+#      of using a generic rule engine or external message-template layer, keeping each legal/store
+#      rule easy to read and test in isolation.
+#    - Brand and spec conflict checks in validate_product_consistency() target the actual structure
+#      and manufacturers of products.csv rather than using open-ended NLP heuristics.
