@@ -15,36 +15,6 @@ _ACTIVE_DB_CONN: sqlite3.Connection | None = None
 _ACTIVE_DB_KEY: str | None = None
 _DB_LOCK = threading.RLock()
 
-_POLICY_STOPWORDS = { # TODO isso aqui é necessario?
-    "como",
-    "para",
-    "qual",
-    "quais",
-    "loja",
-    "sobre",
-    "pelo",
-    "pela",
-    "onde",
-    "quando",
-    "tem",
-    "uma",
-    "uns",
-    "umas",
-    "dos",
-    "das",
-    "nos",
-    "nas",
-    "por",
-    "com",
-    "sem",
-    "que",
-    "isso",
-    "esse",
-    "essa",
-    "emporio",
-    "musica",
-}
-
 
 # Normalize a database path into a canonical key so str and Path compare equally.
 def _normalize_db_path(db_path: Path | str) -> str:
@@ -515,10 +485,8 @@ def search_policy_sections(topic: str, pdf_path: Path = POLICIES_PDF_PATH) -> st
         ):
             matched_keys.append(sec_num)
 
-    # Score normalized query tokens (excluding common stopwords) against headings and body text.
-    tokens = [
-        t for t in norm_topic.split() if len(t) >= 3 and t not in _POLICY_STOPWORDS
-    ]
+    # Score normalized query tokens (4+ chars) against section headings and body text.
+    tokens = [t for t in norm_topic.split() if len(t) >= 4]
     scored_sections: list[tuple[int, str]] = []
 
     for sec_num, content in sections.items():
@@ -582,8 +550,9 @@ def search_policy_sections(topic: str, pdf_path: Path = POLICIES_PDF_PATH) -> st
 #    - Normalized database paths (_normalize_db_path) and managed connection closing on switch/reset.
 #    - Added foreign key constraints (PRAGMA foreign_keys = ON), parent-before-child table loading,
 #      and atomic rollback/close if CSV ingestion fails.
-#    - Filtered common Portuguese stopwords in search_policy_sections() and replaced full-PDF
-#      fallback dumps with a compact section directory + Section 1 overview.
+#    - Simplified search_policy_sections() token scoring to use >= 4-character tokens (removing
+#      hardcoded _POLICY_STOPWORDS) and replaced full-PDF fallback dumps with a compact section
+#      directory + Section 1 overview.
 # 2. Known trade-offs left out to avoid over-engineering for this challenge:
 #    - init_database() drops and recreates tables from the static CSV files on initialization
 #      because SQLite is used here as a local query layer over the challenge dataset, not as
