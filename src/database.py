@@ -45,103 +45,106 @@ def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
 # Return the shared SQLite connection, reusing it when the normalized path matches.
 def get_db_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     global _ACTIVE_DB_CONN, _ACTIVE_DB_KEY
-    target_key = _normalize_db_path(db_path)
+    with _DB_LOCK:
+        target_key = _normalize_db_path(db_path)
 
-    if _ACTIVE_DB_CONN is not None and (
-        _ACTIVE_DB_KEY == target_key or _ACTIVE_DB_KEY == "__custom_injected__"
-    ):
+        if _ACTIVE_DB_CONN is not None and (
+            _ACTIVE_DB_KEY == target_key or _ACTIVE_DB_KEY == "__custom_injected__"
+        ):
+            return _ACTIVE_DB_CONN
+
+        if _ACTIVE_DB_CONN is not None:
+            try:
+                _ACTIVE_DB_CONN.close()
+            except sqlite3.Error:
+                pass
+
+        _ACTIVE_DB_CONN = init_database(db_path)
+        _ACTIVE_DB_KEY = target_key
         return _ACTIVE_DB_CONN
-
-    if _ACTIVE_DB_CONN is not None:
-        try:
-            _ACTIVE_DB_CONN.close()
-        except sqlite3.Error:
-            pass
-
-    _ACTIVE_DB_CONN = init_database(db_path)
-    _ACTIVE_DB_KEY = target_key
-    return _ACTIVE_DB_CONN
 
 
 # Set or reset the shared SQLite connection (used by automated tests).
 def set_db_connection(conn: sqlite3.Connection | None) -> None:
     global _ACTIVE_DB_CONN, _ACTIVE_DB_KEY
-    if _ACTIVE_DB_CONN is not None and _ACTIVE_DB_CONN is not conn:
-        try:
-            _ACTIVE_DB_CONN.close()
-        except sqlite3.Error:
-            pass
-    _ACTIVE_DB_CONN = conn
-    _ACTIVE_DB_KEY = "__custom_injected__" if conn is not None else None
+    with _DB_LOCK:
+        if _ACTIVE_DB_CONN is not None and _ACTIVE_DB_CONN is not conn:
+            try:
+                _ACTIVE_DB_CONN.close()
+            except sqlite3.Error:
+                pass
+        _ACTIVE_DB_CONN = conn
+        _ACTIVE_DB_KEY = "__custom_injected__" if conn is not None else None
 
 
 # Create fresh tables with foreign keys and atomically load all 6 CSV files into SQLite.
 def init_database(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
-    validate_data_files()
-    conn = get_connection(db_path)
-    cursor = conn.cursor()
+    with _DB_LOCK:
+        validate_data_files()
+        conn = get_connection(db_path)
+        cursor = conn.cursor()
 
-    schema_Statements = [
-        "DROP TABLE IF EXISTS order_items",
-        "DROP TABLE IF EXISTS orders",
-        "DROP TABLE IF EXISTS promotions",
-        "DROP TABLE IF EXISTS products",
-        "DROP TABLE IF EXISTS customers",
-        "DROP TABLE IF EXISTS categories",
-        (
-            "CREATE TABLE categories ("
-            "category_id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT)"
-        ),
-        (
-            "CREATE TABLE customers ("
-            "customer_id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
-            "phone TEXT, email TEXT, city TEXT)"
-        ),
-        (
-            "CREATE TABLE products ("
-            "product_id INTEGER PRIMARY KEY, price_brl REAL NOT NULL, name TEXT NOT NULL, "
-            "category_id INTEGER NOT NULL, description TEXT, stock_quantity INTEGER NOT NULL, "
-            "status TEXT NOT NULL, specs TEXT, created_at TEXT, "
-            "FOREIGN KEY (category_id) REFERENCES categories(category_id))"
-        ),
-        (
-            "CREATE TABLE promotions ("
-            "promotion_id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, "
-            "discount_percent REAL NOT NULL, description TEXT, is_active INTEGER NOT NULL, "
-            "FOREIGN KEY (product_id) REFERENCES products(product_id))"
-        ),
-        (
-            "CREATE TABLE orders ("
-            "order_id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, order_date TEXT NOT NULL, "
-            "status TEXT NOT NULL, total_brl REAL NOT NULL, payment_method TEXT NOT NULL, "
-            "tracking_code TEXT, estimated_delivery TEXT, notes TEXT, "
-            "FOREIGN KEY (customer_id) REFERENCES customers(customer_id))"
-        ),
-        (
-            "CREATE TABLE order_items ("
-            "order_id INTEGER NOT NULL, quantity INTEGER NOT NULL, product_id INTEGER NOT NULL, "
-            "FOREIGN KEY (order_id) REFERENCES orders(order_id), "
-            "FOREIGN KEY (product_id) REFERENCES products(product_id))"
-        ),
-    ]
+        schema_Statements = [
+            "DROP TABLE IF EXISTS order_items",
+            "DROP TABLE IF EXISTS orders",
+            "DROP TABLE IF EXISTS promotions",
+            "DROP TABLE IF EXISTS products",
+            "DROP TABLE IF EXISTS customers",
+            "DROP TABLE IF EXISTS categories",
+            (
+                "CREATE TABLE categories ("
+                "category_id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT)"
+            ),
+            (
+                "CREATE TABLE customers ("
+                "customer_id INTEGER PRIMARY KEY, name TEXT NOT NULL, "
+                "phone TEXT, email TEXT, city TEXT)"
+            ),
+            (
+                "CREATE TABLE products ("
+                "product_id INTEGER PRIMARY KEY, price_brl REAL NOT NULL, name TEXT NOT NULL, "
+                "category_id INTEGER NOT NULL, description TEXT, stock_quantity INTEGER NOT NULL, "
+                "status TEXT NOT NULL, specs TEXT, created_at TEXT, "
+                "FOREIGN KEY (category_id) REFERENCES categories(category_id))"
+            ),
+            (
+                "CREATE TABLE promotions ("
+                "promotion_id INTEGER PRIMARY KEY, product_id INTEGER NOT NULL, "
+                "discount_percent REAL NOT NULL, description TEXT, is_active INTEGER NOT NULL, "
+                "FOREIGN KEY (product_id) REFERENCES products(product_id))"
+            ),
+            (
+                "CREATE TABLE orders ("
+                "order_id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, order_date TEXT NOT NULL, "
+                "status TEXT NOT NULL, total_brl REAL NOT NULL, payment_method TEXT NOT NULL, "
+                "tracking_code TEXT, estimated_delivery TEXT, notes TEXT, "
+                "FOREIGN KEY (customer_id) REFERENCES customers(customer_id))"
+            ),
+            (
+                "CREATE TABLE order_items ("
+                "order_id INTEGER NOT NULL, quantity INTEGER NOT NULL, product_id INTEGER NOT NULL, "
+                "FOREIGN KEY (order_id) REFERENCES orders(order_id), "
+                "FOREIGN KEY (product_id) REFERENCES products(product_id))"
+            ),
+        ]
 
-    try:
-        for stmt in schema_Statements:
-            cursor.execute(stmt)
+        try:
+            for stmt in schema_Statements:
+                cursor.execute(stmt)
 
-        _load_categories(cursor, CSV_FILES["categories"])
-        _load_customers(cursor, CSV_FILES["customers"])
-        _load_products(cursor, CSV_FILES["products"])
-        _load_promotions(cursor, CSV_FILES["promotions"])
-        _load_orders(cursor, CSV_FILES["orders"])
-        _load_order_items(cursor, CSV_FILES["order_items"])
+            _load_categories(cursor, CSV_FILES["categories"])
+            _load_customers(cursor, CSV_FILES["customers"])
+            _load_products(cursor, CSV_FILES["products"])
+            _load_promotions(cursor, CSV_FILES["promotions"])
+            _load_orders(cursor, CSV_FILES["orders"])
+            _load_order_items(cursor, CSV_FILES["order_items"])
 
-        conn.commit()
-        return conn
-    except Exception:
-        conn.rollback()
-        conn.close()
-        raise
+            conn.commit()
+            return conn
+        except Exception:
+            conn.rollback()
+            conn.close()
+            raise
 
 
 # Load categories.csv rows into SQLite.
